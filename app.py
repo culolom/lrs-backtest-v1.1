@@ -440,7 +440,6 @@ if st.button("開始回測 🚀"):
             <td>{fmt_num(sortino_bh)}</td>
             <td>{fmt_num(sortino_bench)}</td>
         </tr>
-
         <tr class='section-title'><td colspan='4'>💹 交易統計</td></tr>
         <tr><td>買進次數</td>
             <td>{buy_count}</td>
@@ -461,3 +460,4 @@ if st.button("開始回測 🚀"):
         st.success("✅ 回測完成！（含 Benchmark 對照，採真實持倉模擬）")
     else:
         st.success("✅ 回測完成！（採真實持倉模擬）")
+
