@@ -1,4 +1,4 @@
-# app.py — LRS 回測系統（自動偵測台股代號 + 美化報表 + 真實持倉模擬）
+# app.py — LRS 回測系統（含 Benchmark 對照）
 
 import os
 import yfinance as yf
@@ -22,59 +22,25 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 # === Streamlit 頁面設定 ===
 st.set_page_config(page_title="LRS 回測系統", page_icon="📈", layout="wide")
-st.markdown("<h1 style='margin-bottom:0.5em;'>📊 Leverage Rotation Strategy — SMA/EMA 回測系統</h1>", unsafe_allow_html=True)
+st.markdown("<h1 style='margin-bottom:0.5em;'>📊 Leverage Rotation Strategy — SMA/EMA 回測系統（含 Benchmark）</h1>", unsafe_allow_html=True)
 
 # === 自動補 .TW 的函式 ===
 def normalize_symbol(symbol):
-    """讓使用者輸入 0050 / 2330 / 00878 時自動補上 .TW"""
     s = symbol.strip().upper()
     if s.isdigit() or (not "." in s and (s.startswith("00") or s.startswith("23") or s.startswith("008"))):
         s += ".TW"
     return s
 
-# === 函式：取得商品可用資料區間 ===
-@st.cache_data(show_spinner=False)
-def get_available_range(symbol):
-    hist = yf.Ticker(symbol).history(period="max", auto_adjust=True)
-    if hist.empty:
-        return pd.to_datetime("1990-01-01").date(), dt.date.today()
-    return hist.index.min().date(), hist.index.max().date()
-
 # === 使用者輸入 ===
 col1, col2, col3 = st.columns(3)
 with col1:
     raw_symbol = st.text_input("輸入代號（例：00631L.TW, QQQ, 0050, 2330）", "0050")
-
 symbol = normalize_symbol(raw_symbol)
 
-# 若使用者更換代號，自動偵測日期範圍
-if "last_symbol" not in st.session_state or st.session_state.last_symbol != symbol:
-    st.session_state.last_symbol = symbol
-    min_start, max_end = get_available_range(symbol)
-    st.session_state.min_start = min_start
-    st.session_state.max_end = max_end
-else:
-    min_start = st.session_state.min_start
-    max_end = st.session_state.max_end
-
-st.info(f"🔎 {symbol} 可用資料區間：{min_start} ~ {max_end}")
-
 with col2:
-    start = st.date_input(
-        "開始日期",
-        value=max(min_start, pd.to_datetime("2013-01-01").date()),
-        min_value=min_start,
-        max_value=max_end,
-        format="YYYY/MM/DD",
-    )
+    start = st.date_input("開始日期", pd.to_datetime("2013-01-01"))
 with col3:
-    end = st.date_input(
-        "結束日期",
-        value=max_end,
-        min_value=min_start,
-        max_value=max_end,
-        format="YYYY/MM/DD",
-    )
+    end = st.date_input("結束日期", pd.to_datetime("2025-01-01"))
 
 col4, col5, col6 = st.columns(3)
 with col4:
@@ -84,13 +50,28 @@ with col5:
 with col6:
     initial_capital = st.number_input("投入本金（元）", 1000, 1_000_000, 10000, step=1000)
 
+# === 新增 Benchmark 選項 ===
+use_benchmark = st.checkbox("加入大盤 Benchmark 對照")
+if use_benchmark:
+    benchmark_raw = st.text_input("輸入 Benchmark 代號（例：SPY、VT、0050）", "SPY")
+    benchmark_symbol = normalize_symbol(benchmark_raw)
+else:
+    benchmark_symbol = None
+
 # === 主程式 ===
 if st.button("開始回測 🚀"):
     start_early = pd.to_datetime(start) - pd.Timedelta(days=365)
     with st.spinner("資料下載中…（自動多抓一年暖機資料）"):
         df_raw = yf.download(symbol, start=start_early, end=end)
+        if use_benchmark:
+            df_bench = yf.download(benchmark_symbol, start=start_early, end=end)
+        else:
+            df_bench = None
+
         if isinstance(df_raw.columns, pd.MultiIndex):
             df_raw.columns = df_raw.columns.get_level_values(0)
+        if df_bench is not None and isinstance(df_bench.columns, pd.MultiIndex):
+            df_bench.columns = df_bench.columns.get_level_values(0)
 
     if df_raw.empty:
         st.error(f"⚠️ 無法下載 {symbol} 的資料，請確認代號或時間區間。")
@@ -103,7 +84,7 @@ if st.button("開始回測 🚀"):
         else df["Close"].ewm(span=window, adjust=False).mean()
     )
 
-    # === 生成訊號（第一天強制買入） ===
+    # === 生成訊號 ===
     df["Signal"] = 0
     df.loc[df.index[0], "Signal"] = 1
     for i in range(1, len(df)):
@@ -128,101 +109,60 @@ if st.button("開始回測 🚀"):
     df["Return"] = df["Close"].pct_change().fillna(0)
     df["Strategy_Return"] = df["Return"] * df["Position"]
 
-    # === 真實資金曲線 ===
-    df["Equity_LRS"] = 1.0
-    for i in range(1, len(df)):
-        if df["Position"].iloc[i - 1] == 1:
-            df.loc[df.index[i], "Equity_LRS"] = df["Equity_LRS"].iloc[i - 1] * (1 + df["Return"].iloc[i])
-        else:
-            df.loc[df.index[i], "Equity_LRS"] = df["Equity_LRS"].iloc[i - 1]
-
+    # === 資金曲線 ===
+    df["Equity_LRS"] = (1 + df["Strategy_Return"]).cumprod()
     df["Equity_BuyHold"] = (1 + df["Return"]).cumprod()
 
-    df = df.loc[pd.to_datetime(start): pd.to_datetime(end)].copy()
-    df["Equity_LRS"] /= df["Equity_LRS"].iloc[0]
-    df["Equity_BuyHold"] /= df["Equity_BuyHold"].iloc[0]
+    # === Benchmark ===
+    if df_bench is not None and not df_bench.empty:
+        df_bench["Return"] = df_bench["Close"].pct_change().fillna(0)
+        df_bench["Equity_Bench"] = (1 + df_bench["Return"]).cumprod()
+        df = df.join(df_bench["Equity_Bench"], how="inner")
 
+    df = df.loc[pd.to_datetime(start): pd.to_datetime(end)].copy()
     df["LRS_Capital"] = df["Equity_LRS"] * initial_capital
     df["BH_Capital"] = df["Equity_BuyHold"] * initial_capital
-
-    # === 買賣點 ===
-    buy_points = [(df.index[i], df["Close"].iloc[i]) for i in range(1, len(df)) if df["Signal"].iloc[i] == 1]
-    sell_points = [(df.index[i], df["Close"].iloc[i]) for i in range(1, len(df)) if df["Signal"].iloc[i] == -1]
-    buy_count, sell_count = len(buy_points), len(sell_points)
+    if df_bench is not None and not df_bench.empty:
+        df["Bench_Capital"] = df["Equity_Bench"] / df["Equity_Bench"].iloc[0] * initial_capital
 
     # === 指標 ===
-    final_return_lrs = df["Equity_LRS"].iloc[-1] - 1
-    final_return_bh = df["Equity_BuyHold"].iloc[-1] - 1
-    years_len = (df.index[-1] - df.index[0]).days / 365
-    cagr_lrs = (1 + final_return_lrs) ** (1 / years_len) - 1
-    cagr_bh = (1 + final_return_bh) ** (1 / years_len) - 1
-    mdd_lrs = 1 - (df["Equity_LRS"] / df["Equity_LRS"].cummax()).min()
-    mdd_bh = 1 - (df["Equity_BuyHold"] / df["Equity_BuyHold"].cummax()).min()
+    def calc(series):
+        total = series.iloc[-1] - 1
+        cagr = (1 + total) ** (1 / ((df.index[-1] - df.index[0]).days / 365)) - 1
+        mdd = 1 - (series / series.cummax()).min()
+        return total, cagr, mdd
 
-    def calc_metrics(series):
-        daily = series.dropna()
-        avg = daily.mean()
-        std = daily.std()
-        downside = daily[daily < 0].std()
-        vol = std * np.sqrt(252)
-        sharpe = (avg / std) * np.sqrt(252) if std > 0 else np.nan
-        sortino = (avg / downside) * np.sqrt(252) if downside > 0 else np.nan
-        return vol, sharpe, sortino
-
-    vol_lrs, sharpe_lrs, sortino_lrs = calc_metrics(df["Strategy_Return"])
-    vol_bh, sharpe_bh, sortino_bh = calc_metrics(df["Return"])
-
-    equity_lrs_final = df["LRS_Capital"].iloc[-1]
-    equity_bh_final = df["BH_Capital"].iloc[-1]
+    final_lrs, cagr_lrs, mdd_lrs = calc(df["Equity_LRS"])
+    final_bh, cagr_bh, mdd_bh = calc(df["Equity_BuyHold"])
+    if df_bench is not None and "Equity_Bench" in df:
+        final_bench, cagr_bench, mdd_bench = calc(df["Equity_Bench"])
+    else:
+        final_bench = cagr_bench = mdd_bench = np.nan
 
     # === 圖表 ===
-    st.markdown("<h2 style='margin-top:1em;'>📈 策略績效視覺化</h2>", unsafe_allow_html=True)
+    st.markdown("<h2>📈 策略績效視覺化</h2>", unsafe_allow_html=True)
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        subplot_titles=("收盤價與均線（含買賣點）", "資金曲線：LRS vs Buy&Hold"))
+                        subplot_titles=("收盤價與均線（含買賣點）", "資金曲線比較"))
+
     fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="收盤價", line=dict(color="blue")), row=1, col=1)
     fig.add_trace(go.Scatter(x=df.index, y=df["MA"], name=f"{ma_type}{window}", line=dict(color="orange")), row=1, col=1)
-    if buy_points:
-        bx, by = zip(*buy_points)
-        fig.add_trace(go.Scatter(x=bx, y=by, mode="markers", name="買進",
-                                 marker=dict(color="green", symbol="triangle-up", size=8)), row=1, col=1)
-    if sell_points:
-        sx, sy = zip(*sell_points)
-        fig.add_trace(go.Scatter(x=sx, y=sy, mode="markers", name="賣出",
-                                 marker=dict(color="red", symbol="x", size=8)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["Equity_LRS"], name="LRS 策略",
-                             line=dict(color="green")), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=df["Equity_BuyHold"], name="Buy & Hold",
-                             line=dict(color="gray", dash="dot")), row=2, col=1)
-    fig.update_layout(height=800, showlegend=True, template="plotly_white")
+    fig.add_trace(go.Scatter(x=df.index, y=df["Equity_LRS"], name="LRS 策略", line=dict(color="green")), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["Equity_BuyHold"], name="Buy & Hold", line=dict(color="gray", dash="dot")), row=2, col=1)
+    if df_bench is not None and "Equity_Bench" in df:
+        fig.add_trace(go.Scatter(x=df.index, y=df["Equity_Bench"], name=f"Benchmark ({benchmark_symbol})", line=dict(color="purple", dash="dash")), row=2, col=1)
+    fig.update_layout(height=800, template="plotly_white")
     st.plotly_chart(fig, use_container_width=True)
 
-    # === 美化報表 ===
-    st.markdown("""
-    <style>
-    .custom-table { width:100%; border-collapse:collapse; margin-top:1.2em; font-family:"Noto Sans TC"; }
-    .custom-table th { background:#f5f6fa; padding:12px; font-weight:700; border-bottom:2px solid #ddd; }
-    .custom-table td { text-align:center; padding:10px; border-bottom:1px solid #eee; font-size:15px; }
-    .custom-table tr:nth-child(even) td { background-color:#fafbfc; }
-    .custom-table tr:hover td { background-color:#f1f9ff; }
-    .section-title td { background:#eef4ff; color:#1a237e; font-weight:700; font-size:16px; text-align:left; padding:10px 15px; }
-    </style>
-    """, unsafe_allow_html=True)
-
+    # === 報表 ===
     html_table = f"""
-    <table class='custom-table'>
-    <thead><tr><th>指標名稱</th><th>LRS 策略</th><th>Buy & Hold</th></tr></thead>
+    <table style='width:100%; border-collapse:collapse; margin-top:1em; font-family:"Noto Sans TC";'>
+    <thead><tr><th>指標名稱</th><th>LRS 策略</th><th>Buy & Hold</th><th>Benchmark</th></tr></thead>
     <tbody>
-    <tr><td>最終資產</td><td>{equity_lrs_final:,.0f} 元</td><td>{equity_bh_final:,.0f} 元</td></tr>
-    <tr><td>總報酬</td><td>{final_return_lrs:.2%}</td><td>{final_return_bh:.2%}</td></tr>
-    <tr><td>年化報酬</td><td>{cagr_lrs:.2%}</td><td>{cagr_bh:.2%}</td></tr>
-    <tr><td>最大回撤</td><td>{mdd_lrs:.2%}</td><td>{mdd_bh:.2%}</td></tr>
-    <tr><td>年化波動率</td><td>{vol_lrs:.2%}</td><td>{vol_bh:.2%}</td></tr>
-    <tr><td>夏普值</td><td>{sharpe_lrs:.2f}</td><td>{sharpe_bh:.2f}</td></tr>
-    <tr><td>索提諾值</td><td>{sortino_lrs:.2f}</td><td>{sortino_bh:.2f}</td></tr>
-    <tr class='section-title'><td colspan='3'>💹 交易統計</td></tr>
-    <tr><td>買進次數</td><td>{buy_count}</td><td>—</td></tr>
-    <tr><td>賣出次數</td><td>{sell_count}</td><td>—</td></tr>
+    <tr><td>總報酬</td><td>{final_lrs:.2%}</td><td>{final_bh:.2%}</td><td>{final_bench:.2%}</td></tr>
+    <tr><td>年化報酬</td><td>{cagr_lrs:.2%}</td><td>{cagr_bh:.2%}</td><td>{cagr_bench:.2%}</td></tr>
+    <tr><td>最大回撤</td><td>{mdd_lrs:.2%}</td><td>{mdd_bh:.2%}</td><td>{mdd_bench:.2%}</td></tr>
     </tbody></table>
     """
     st.markdown(html_table, unsafe_allow_html=True)
-    st.success("✅ 回測完成！（支援自動辨識台股代號）")
+
+    st.success("✅ 回測完成！（含 Benchmark 對照）")
